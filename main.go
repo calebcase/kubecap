@@ -17,6 +17,9 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/homedir"
 	metricsv "k8s.io/metrics/pkg/client/clientset/versioned"
+
+	// Ensure the OIDC provider is loaded.
+	_ "k8s.io/client-go/plugin/pkg/client/auth/oidc"
 )
 
 type NodePods map[string][]*corev1.Pod
