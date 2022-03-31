@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -71,11 +70,13 @@ func (nps NodePods) MemoryRequests(nodeName string) (total *resource.Quantity) {
 }
 
 func main() {
-	if len(os.Args) < 2 {
-		panic(errors.New("please pass the amount of additional memory you want to use"))
+	additionalAmountStr := "0 MiB"
+
+	if len(os.Args) >= 2 {
+		additionalAmountStr = os.Args[1]
 	}
 
-	additional, err := humanize.ParseBytes(os.Args[1])
+	additional, err := humanize.ParseBytes(additionalAmountStr)
 	if err != nil {
 		panic(err.Error())
 	}
@@ -102,6 +103,11 @@ func main() {
 		panic(err.Error())
 	}
 
+	podMetricsList, err := mcs.MetricsV1beta1().PodMetricses("").List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		panic(err.Error())
+	}
+
 	podList, err := kcs.CoreV1().Pods("").List(context.TODO(), metav1.ListOptions{})
 	if err != nil {
 		panic(err.Error())
@@ -109,8 +115,8 @@ func main() {
 
 	nps := NewNodePods(podList)
 
-	table := tablewriter.NewWriter(os.Stdout)
-	table.SetHeader([]string{
+	nodeTable := tablewriter.NewWriter(os.Stdout)
+	nodeTable.SetHeader([]string{
 		"Name",
 		"Allocatable",
 		"Used",
@@ -118,9 +124,20 @@ func main() {
 		"Requsts",
 		"Efficiency",
 		"Schedulable",
-		fmt.Sprintf("Free - %s", os.Args[1]),
-		fmt.Sprintf("Schedulable - %s", os.Args[1]),
+		fmt.Sprintf("Free - %s", additionalAmountStr),
+		fmt.Sprintf("Schedulable - %s", additionalAmountStr),
 		"Ok?",
+	})
+
+	evictableTable := tablewriter.NewWriter(os.Stdout)
+	evictableTable.SetHeader([]string{
+		"Node",
+		"Namespace",
+		"Pod",
+		"Container",
+		"Requests",
+		"Used",
+		"Limits",
 	})
 
 	sort.Slice(nodeMetricsList.Items, func(i, j int) bool {
@@ -148,7 +165,58 @@ func main() {
 
 		enough := fwa > 0 && swa > 0
 
-		table.Append([]string{
+		if !enough {
+			// Find the containers that are over their requests...
+			for _, pod := range nps[node.Name] {
+				for _, container := range pod.Spec.Containers {
+					memReq := container.Resources.Requests.Memory()
+					memLim := container.Resources.Limits.Memory()
+
+					if memReq != nil && !memReq.IsZero() {
+						// Don't worry about containers that have requests equal to limits.
+						if memLim != nil && memReq.Cmp(*memLim) >= 0 {
+							continue
+						}
+
+						// NOTE: This could be more efficient if the pod metrics list was first
+						// pre-processed into a shape that made it easy to select exactly the
+						// container we want. But this is good enough for now.
+						for _, pm := range podMetricsList.Items {
+							if pm.Namespace != pod.Namespace {
+								continue
+							}
+
+							if pm.Name != pod.Name {
+								continue
+							}
+
+							for _, pmc := range pm.Containers {
+								if pmc.Name != container.Name {
+									continue
+								}
+
+								// We have a match!
+								if memUsed, ok := pmc.Usage[corev1.ResourceMemory]; ok {
+									if memReq.Cmp(memUsed) < 0 {
+										evictableTable.Append([]string{
+											node.Name,
+											pod.Namespace,
+											pod.Name,
+											container.Name,
+											humanize.Comma(memReq.Value()),
+											humanize.Comma(memUsed.Value()),
+											humanize.Comma(memLim.Value()),
+										})
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+
+		nodeTable.Append([]string{
 			name,
 			humanize.Comma(allocatable),
 			humanize.Comma(used),
@@ -162,5 +230,9 @@ func main() {
 		})
 	}
 
-	table.Render()
+	fmt.Println("Node Report")
+	nodeTable.Render()
+
+	fmt.Println("Evictable Pods Report")
+	evictableTable.Render()
 }
